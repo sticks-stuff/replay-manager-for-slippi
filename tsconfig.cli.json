@@ -1,0 +1,29 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "incremental": false,
+    "outDir": "dist/cli",
+    "rootDir": "src",
+    "sourceMap": false
+  },
+  "include": [
+    "decs.d.ts",
+    "src/cli/shims.d.ts",
+    "src/cli/**/*.ts",
+    "src/common/**/*.ts",
+    "src/main/replay.ts",
+    "src/main/host.ts",
+    "src/main/util.ts"
+  ],
+  "exclude": [
+    "src/renderer/**",
+    "src/main/main.ts",
+    "src/main/ipc.ts",
+    "src/main/menu.ts",
+    "src/main/preload.ts",
+    "src/main/offlinemode.ts",
+    "src/main/challonge.ts",
+    "src/main/parrygg.ts"
+  ]
+}

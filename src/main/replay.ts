@@ -14,7 +14,6 @@ import sanitize from 'sanitize-filename';
 import { ZipFile } from 'yazl';
 import { parse } from 'date-fns';
 import { buffer as bufferConsumer, text } from 'stream/consumers';
-import yauzl from 'yauzl-promise';
 import {
   Context,
   CopyHostOrClient,
@@ -24,7 +23,11 @@ import {
   Replay,
 } from '../common/types';
 import { isValidCharacter } from '../common/constants';
-import { writeZip } from './host';
+
+async function writeZipRemote(subdir: string, buffer: Buffer) {
+  const { writeZip } = await import('./host');
+  return writeZip(subdir, buffer);
+}
 
 // https://github.com/project-slippi/slippi-launcher/blob/ae8bb69e235b6e46b24bc966aeaa80f45030c6f9/src/replays/file_system_replay_provider/load_file.ts#L91-L101
 // ty vince
@@ -81,400 +84,255 @@ function unsetWinnerIfTie(players: Player[]) {
 export async function getReplaysInDir(
   dir: string,
 ): Promise<{ replays: Replay[]; invalidReplays: InvalidReplay[] }> {
-  const objs = (await readdir(dir, { withFileTypes: true }))
+  const fileNames = (await readdir(dir, { withFileTypes: true }))
     .filter((dirent) => dirent.isFile() && dirent.name.endsWith('.slp'))
-    .map(async (dirent): Promise<Replay | InvalidReplay> => {
-      const fileName = dirent.name;
-      const filePath = join(dir, fileName);
+    .map((dirent) => dirent.name);
 
-      let fileHandle;
-      try {
-        fileHandle = await open(filePath);
-      } catch (e: any) {
-        const invalidReason = e instanceof Error ? e.message : e;
-        return { fileName, invalidReason };
+  return getReplaysByPaths(fileNames.map((fileName) => join(dir, fileName)));
+}
+
+async function parseReplayFile(
+  filePath: string,
+): Promise<Replay | InvalidReplay> {
+  const fileName = path.basename(filePath);
+
+  let fileHandle;
+  try {
+    fileHandle = await open(filePath);
+  } catch (e: any) {
+    const invalidReason = e instanceof Error ? e.message : e;
+    return { fileName, invalidReason };
+  }
+
+  try {
+    // raw header
+    const rawHeader = Buffer.alloc(15);
+    const rawHeaderRes = await fileHandle.read(rawHeader, 0, 15, 0);
+    if (rawHeaderRes.bytesRead !== 15) {
+      return { fileName, invalidReason: 'File corrupted.' };
+    }
+    if (!rawHeader.subarray(0, 11).equals(RAW_HEADER_START)) {
+      return { fileName, invalidReason: 'File corrupted.' };
+    }
+    const replayLength = rawHeader.subarray(11, 15).readUInt32BE();
+    const metadataOffset = replayLength + 15;
+
+    // event payloads header
+    const payloadsHeader = Buffer.alloc(2);
+    const payloadsHeaderRes = await fileHandle.read(
+      payloadsHeader,
+      0,
+      2,
+      15,
+    );
+    if (payloadsHeaderRes.bytesRead !== 2) {
+      return { fileName, invalidReason: 'File corrupted.' };
+    }
+    if (payloadsHeader[0] !== 0x35) {
+      return { fileName, invalidReason: 'File corrupted.' };
+    }
+
+    // event payloads
+    const payloadsSize = payloadsHeader[1] - 1;
+    const payloads = Buffer.alloc(payloadsSize);
+    const payloadsRes = await fileHandle.read(payloads, 0, payloadsSize, 17);
+    if (payloadsRes.bytesRead !== payloadsSize) {
+      return { fileName, invalidReason: 'File corrupted.' };
+    }
+    let gameStartSize = 0;
+    let postFrameUpdateSize = 0;
+    let frameBookendSize = 0;
+    let gameEndSize = 0;
+    for (let i = 0; i < payloadsSize; i += 3) {
+      const payloadSize = payloads.subarray(i + 1, i + 3).readUInt16BE();
+      if (payloadSize === 0) {
+        return { fileName, invalidReason: 'File corrupted.' };
       }
+      if (payloads[i] === 0x36) {
+        gameStartSize = payloadSize + 1;
+      } else if (payloads[i] === 0x38) {
+        postFrameUpdateSize = payloadSize + 1;
+      } else if (payloads[i] === 0x39) {
+        gameEndSize = payloadSize + 1;
+      } else if (payloads[i] === 0x3c) {
+        frameBookendSize = payloadSize + 1;
+      }
+    }
 
-      try {
-        // raw header
-        const rawHeader = Buffer.alloc(15);
-        const rawHeaderRes = await fileHandle.read(rawHeader, 0, 15, 0);
-        if (rawHeaderRes.bytesRead !== 15) {
-          return { fileName, invalidReason: 'File corrupted.' };
-        }
-        if (!rawHeader.subarray(0, 11).equals(RAW_HEADER_START)) {
-          return { fileName, invalidReason: 'File corrupted.' };
-        }
-        const replayLength = rawHeader.subarray(11, 15).readUInt32BE();
-        const metadataOffset = replayLength + 15;
+    // game start
+    const gameStart = Buffer.alloc(gameStartSize);
+    const gameStartRes = await fileHandle.read(
+      gameStart,
+      0,
+      gameStartSize,
+      17 + payloadsSize,
+    );
+    if (gameStartRes.bytesRead !== gameStartSize) {
+      return { fileName, invalidReason: 'File corrupted.' };
+    }
+    if (gameStart[0] !== 0x36) {
+      return { fileName, invalidReason: 'File corrupted.' };
+    }
 
-        // event payloads header
-        const payloadsHeader = Buffer.alloc(2);
-        const payloadsHeaderRes = await fileHandle.read(
-          payloadsHeader,
-          0,
-          2,
-          15,
-        );
-        if (payloadsHeaderRes.bytesRead !== 2) {
-          return { fileName, invalidReason: 'File corrupted.' };
-        }
-        if (payloadsHeader[0] !== 0x35) {
-          return { fileName, invalidReason: 'File corrupted.' };
-        }
+    const version = gameStart.readUint32BE(1);
+    if (version < 0x030d0000) {
+      // Display Names/Connect Codes added in 3.9.0
+      // Player Placements added in 3.13.0
+      return {
+        fileName,
+        invalidReason: 'Replay version too old. Update Slippi Nintendont.',
+      };
+    }
 
-        // event payloads
-        const payloadsSize = payloadsHeader[1] - 1;
-        const payloads = Buffer.alloc(payloadsSize);
-        const payloadsRes = await fileHandle.read(
-          payloads,
-          0,
-          payloadsSize,
-          17,
-        );
-        if (payloadsRes.bytesRead !== payloadsSize) {
-          return { fileName, invalidReason: 'File corrupted.' };
-        }
-        const payloadSizes = new Map<number, number>();
-        let gameStartSize = 0;
-        let postFrameUpdateSize = 0;
-        let frameBookendSize = 0;
-        let gameEndSize = 0;
-        for (let i = 0; i < payloadsSize; i += 3) {
-          const payloadSize = payloads.subarray(i + 1, i + 3).readUInt16BE();
-          if (payloadSize === 0) {
-            return { fileName, invalidReason: 'File corrupted.' };
-          }
-          payloadSizes.set(payloads[i], payloadSize);
-          if (payloads[i] === 0x36) {
-            gameStartSize = payloadSize + 1;
-          } else if (payloads[i] === 0x38) {
-            postFrameUpdateSize = payloadSize + 1;
-          } else if (payloads[i] === 0x39) {
-            gameEndSize = payloadSize + 1;
-          } else if (payloads[i] === 0x3c) {
-            frameBookendSize = payloadSize + 1;
-          }
-        }
+    const isTeams = gameStart[13] === 1;
+    const stageId = gameStart.subarray(19, 21).readUint16BE();
+    const gameTimerSeconds = gameStart.subarray(21, 25).readUint32BE();
 
-        // game start
-        const gameStart = Buffer.alloc(gameStartSize);
-        const gameStartRes = await fileHandle.read(
-          gameStart,
-          0,
-          gameStartSize,
-          17 + payloadsSize,
-        );
-        if (gameStartRes.bytesRead !== gameStartSize) {
-          return { fileName, invalidReason: 'File corrupted.' };
+    const teamSizes = new Map<number, number>();
+    let numPlayers = 0;
+    let hasCPUPlayers = false;
+    let hasIllegalCharacters = false;
+    const players = new Array<Player>(4) as [Player, Player, Player, Player];
+    for (let i = 0; i < 4; i += 1) {
+      const offset = i * 36 + 101;
+      const teamId = isTeams ? gameStart[offset + 9] : -1;
+      players[i] = {
+        isWinner: false,
+        playerOverrides: {
+          displayName: '',
+          entrantId: 0,
+          participantId: 0,
+          prefix: '',
+          pronouns: '',
+        },
+        playerType: gameStart[offset + 1],
+        port: i + 1,
+        stocksRemaining: -1,
+        finalPercent: -1,
+        teamId,
+      } as Player;
+      if (players[i].playerType === 0 || players[i].playerType === 1) {
+        numPlayers += 1;
+        players[i].costumeIndex = gameStart[offset + 3];
+        players[i].externalCharacterId = gameStart[offset];
+        if (isTeams) {
+          const currTeamSize = teamSizes.get(teamId) || 0;
+          teamSizes.set(teamId, currTeamSize + 1);
         }
-        if (gameStart[0] !== 0x36) {
-          return { fileName, invalidReason: 'File corrupted.' };
+        if (players[i].playerType === 1) {
+          hasCPUPlayers = true;
         }
+        if (!isValidCharacter(players[i].externalCharacterId)) {
+          hasIllegalCharacters = true;
+        }
+      }
+    }
 
-        const version = gameStart.readUint32BE(1);
-        if (version < 0x030d0000) {
-          // Display Names/Connect Codes added in 3.9.0
-          // Player Placements added in 3.13.0
-          return {
-            fileName,
-            invalidReason: 'Replay version too old. Update Slippi Nintendont.',
-          };
-        }
-
-        const isTeams = gameStart[13] === 1;
-        const stageId = gameStart.subarray(19, 21).readUint16BE();
-        const gameTimerSeconds = gameStart.subarray(21, 25).readUint32BE();
-
-        const teamSizes = new Map<number, number>();
-        let numPlayers = 0;
-        let hasCPUPlayers = false;
-        let hasIllegalCharacters = false;
-        const players = new Array<Player>(4) as [
-          Player,
-          Player,
-          Player,
-          Player,
-        ];
-        for (let i = 0; i < 4; i += 1) {
-          const offset = i * 36 + 101;
-          const teamId = isTeams ? gameStart[offset + 9] : -1;
-          players[i] = {
-            isWinner: false,
-            playerOverrides: {
-              displayName: '',
-              entrantId: 0,
-              participantId: 0,
-              prefix: '',
-              pronouns: '',
-            },
-            playerType: gameStart[offset + 1],
-            port: i + 1,
-            stocksRemaining: -1,
-            finalPercent: -1,
-            teamId,
-          } as Player;
-          if (players[i].playerType === 0 || players[i].playerType === 1) {
-            numPlayers += 1;
-            players[i].costumeIndex = gameStart[offset + 3];
-            players[i].externalCharacterId = gameStart[offset];
-            if (isTeams) {
-              const currTeamSize = teamSizes.get(teamId) || 0;
-              teamSizes.set(teamId, currTeamSize + 1);
-            }
-            if (players[i].playerType === 1) {
-              hasCPUPlayers = true;
-            }
-            if (!isValidCharacter(players[i].externalCharacterId)) {
-              hasIllegalCharacters = true;
-            }
-          }
-        }
-
-        const invalidReasons: string[] = [];
-        if (hasCPUPlayers) {
-          invalidReasons.push('Has CPU Player(s).');
-        }
-        if (hasIllegalCharacters) {
-          invalidReasons.push('Has illegal character(s).');
-        }
-        if (numPlayers !== 2 && numPlayers !== 4) {
+    const invalidReasons: string[] = [];
+    if (hasCPUPlayers) {
+      invalidReasons.push('Has CPU Player(s).');
+    }
+    if (hasIllegalCharacters) {
+      invalidReasons.push('Has illegal character(s).');
+    }
+    if (numPlayers !== 2 && numPlayers !== 4) {
+      invalidReasons.push('Not singles or doubles.');
+    } else if (numPlayers === 4) {
+      if (isTeams) {
+        const teamSizesArr = Array.from(teamSizes.values());
+        if (teamSizesArr.length !== 2 || teamSizesArr[0] !== teamSizesArr[1]) {
           invalidReasons.push('Not singles or doubles.');
-        } else if (numPlayers === 4) {
-          if (isTeams) {
-            const teamSizesArr = Array.from(teamSizes.values());
-            if (
-              teamSizesArr.length !== 2 ||
-              teamSizesArr[0] !== teamSizesArr[1]
-            ) {
-              invalidReasons.push('Not singles or doubles.');
-            }
-          } else {
-            invalidReasons.push('Not singles or doubles.');
-          }
         }
+      } else {
+        invalidReasons.push('Not singles or doubles.');
+      }
+    }
 
-        for (let i = 0; i < 4; i += 1) {
-          const offset = i * 16 + 353;
-          const nametag = iconv
-            .decode(gameStart.subarray(offset, offset + 16), 'Shift_JIS')
-            .split('\0')
-            .shift();
-          if (nametag) {
-            players[i].nametag = nametag;
-          }
-        }
+    for (let i = 0; i < 4; i += 1) {
+      const offset = i * 16 + 353;
+      const nametag = iconv
+        .decode(gameStart.subarray(offset, offset + 16), 'Shift_JIS')
+        .split('\0')
+        .shift();
+      if (nametag) {
+        players[i].nametag = nametag;
+      }
+    }
 
-        for (let i = 0; i < 4; i += 1) {
-          const offset = i * 31 + 421;
-          const displayName = iconv
-            .decode(gameStart.subarray(offset, offset + 31), 'Shift_JIS')
-            .split('\0')
-            .shift();
-          if (displayName) {
-            players[i].displayName = displayName;
-          }
-        }
+    for (let i = 0; i < 4; i += 1) {
+      const offset = i * 31 + 421;
+      const displayName = iconv
+        .decode(gameStart.subarray(offset, offset + 31), 'Shift_JIS')
+        .split('\0')
+        .shift();
+      if (displayName) {
+        players[i].displayName = displayName;
+      }
+    }
 
-        for (let i = 0; i < 4; i += 1) {
-          const offset = i * 10 + 545;
-          const connectCode = iconv
-            .decode(gameStart.subarray(offset, offset + 10), 'Shift_JIS')
-            .split('\0')
-            .shift();
-          if (connectCode) {
-            players[i].connectCode = connectCode;
-          }
-        }
+    for (let i = 0; i < 4; i += 1) {
+      const offset = i * 10 + 545;
+      const connectCode = iconv
+        .decode(gameStart.subarray(offset, offset + 10), 'Shift_JIS')
+        .split('\0')
+        .shift();
+      if (connectCode) {
+        players[i].connectCode = connectCode;
+      }
+    }
 
-        const stats = await fileHandle.stat();
-        const fileSize = stats.size;
-        let lastFrame = -124;
-        if (replayLength > 0) {
-          const gameEndOffset = metadataOffset - gameEndSize;
-          const frameBookendOffset = gameEndOffset - frameBookendSize;
+    const stats = await fileHandle.stat();
+    const fileSize = stats.size;
+    let lastFrame = -124;
+    if (replayLength > 0) {
+      const gameEndOffset = metadataOffset - gameEndSize;
+      const frameBookendOffset = gameEndOffset - frameBookendSize;
 
-          // last frame bookend
-          const frameBookend = Buffer.alloc(frameBookendSize);
-          const frameBookendRes = await fileHandle.read(
-            frameBookend,
+      // last frame bookend
+      const frameBookend = Buffer.alloc(frameBookendSize);
+      const frameBookendRes = await fileHandle.read(
+        frameBookend,
+        0,
+        frameBookendSize,
+        frameBookendOffset,
+      );
+      if (frameBookendRes.bytesRead === frameBookendSize && frameBookend[0] === 0x3c) {
+        lastFrame = frameBookend.readInt32BE(0x1);
+
+        // last post frame update
+        let postFrameUpdatesSeen = 0;
+        let currentPostFrameUpdateOffset = frameBookendOffset - postFrameUpdateSize;
+        while (postFrameUpdatesSeen < numPlayers) {
+          const postFrameUpdate = Buffer.alloc(postFrameUpdateSize);
+          // eslint-disable-next-line no-await-in-loop
+          const postFrameUpdateRes = await fileHandle.read(
+            postFrameUpdate,
             0,
-            frameBookendSize,
-            frameBookendOffset,
+            postFrameUpdateSize,
+            currentPostFrameUpdateOffset,
           );
           if (
-            frameBookendRes.bytesRead === frameBookendSize &&
-            frameBookend[0] === 0x3c
+            postFrameUpdateRes.bytesRead !== postFrameUpdateSize ||
+            postFrameUpdate[0] !== 0x38 ||
+            postFrameUpdate.readInt32BE(0x1) !== lastFrame
           ) {
-            lastFrame = frameBookend.readInt32BE(0x1);
-
-            // last post frame update
-            let postFrameUpdatesSeen = 0;
-            let currentPostFrameUpdateOffset =
-              frameBookendOffset - postFrameUpdateSize;
-            while (postFrameUpdatesSeen < numPlayers) {
-              const postFrameUpdate = Buffer.alloc(postFrameUpdateSize);
-              // eslint-disable-next-line no-await-in-loop
-              const postFrameUpdateRes = await fileHandle.read(
-                postFrameUpdate,
-                0,
-                postFrameUpdateSize,
-                currentPostFrameUpdateOffset,
-              );
-              if (
-                postFrameUpdateRes.bytesRead !== postFrameUpdateSize ||
-                postFrameUpdate[0] !== 0x38 ||
-                postFrameUpdate.readInt32BE(0x1) !== lastFrame
-              ) {
-                break;
-              }
-              if (postFrameUpdate[0x6] === 0) {
-                // eslint-disable-next-line prefer-destructuring
-                players[postFrameUpdate[0x5]].stocksRemaining =
-                  postFrameUpdate[0x21];
-                players[postFrameUpdate[0x5]].finalPercent =
-                  postFrameUpdate.readFloatBE(0x16);
-                postFrameUpdatesSeen += 1;
-              }
-              currentPostFrameUpdateOffset -= postFrameUpdateSize;
-            }
+            break;
           }
-
-          // game end
-          const gameEnd = Buffer.alloc(gameEndSize);
-          const gameEndRes = await fileHandle.read(
-            gameEnd,
-            0,
-            gameEndSize,
-            gameEndOffset,
-          );
-          if (gameEndRes.bytesRead !== gameEndSize || gameEnd[0] !== 0x39) {
-            invalidReasons.push('Game end event not found.');
-            return {
-              fileName,
-              filePath,
-              invalidReasons,
-              isTeams,
-              lastFrame,
-              players,
-              selected: false,
-              stageId,
-              startAt: filenameToDateAndTime(fileName, stats.birthtimeMs),
-              timeout: false,
-            };
+          if (postFrameUpdate[0x6] === 0) {
+            // eslint-disable-next-line prefer-destructuring
+            players[postFrameUpdate[0x5]].stocksRemaining = postFrameUpdate[0x21];
+            players[postFrameUpdate[0x5]].finalPercent = postFrameUpdate.readFloatBE(0x16);
+            postFrameUpdatesSeen += 1;
           }
-          if (gameEnd[1] !== 1 && gameEnd[1] !== 2 && gameEnd[1] !== 3) {
-            let winnerI = -1;
-            const realPlayers = players.filter(
-              (player) => player.playerType === 0 || player.playerType === 1,
-            );
-            if (realPlayers.length === 2) {
-              let numPlayersWithOneStock = 0;
-              let moreThanOneStockPlayerI = -1;
-              realPlayers.forEach((player) => {
-                if (player.stocksRemaining === 1) {
-                  numPlayersWithOneStock += 1;
-                } else if (player.stocksRemaining > 1) {
-                  moreThanOneStockPlayerI = player.port - 1;
-                }
-              });
-              if (
-                numPlayersWithOneStock === 1 &&
-                moreThanOneStockPlayerI !== -1
-              ) {
-                winnerI = moreThanOneStockPlayerI;
-              }
-            }
-            if (winnerI !== -1) {
-              players[winnerI].isWinner = true;
-            } else {
-              invalidReasons.push('No contest.');
-            }
-          } else {
-            for (let i = 0; i < 4; i += 1) {
-              players[i].isWinner = gameEnd[i + 3] === 0;
-            }
-            unsetWinnerIfTie(players);
-          }
-
-          // metadata
-          const metadataLength = fileSize - metadataOffset;
-          if (metadataLength <= 0) {
-            invalidReasons.push('Metadata not present.');
-            return {
-              fileName,
-              filePath,
-              invalidReasons,
-              isTeams,
-              lastFrame,
-              players,
-              selected: false,
-              stageId,
-              startAt: filenameToDateAndTime(fileName, stats.birthtimeMs),
-              timeout: lastFrame === gameTimerSeconds * 60 && gameEnd[1] === 1,
-            };
-          }
-
-          const metadata = Buffer.alloc(metadataLength);
-          const metadataReadRes = await fileHandle.read(
-            metadata,
-            0,
-            metadataLength,
-            metadataOffset,
-          );
-          if (metadataReadRes.bytesRead !== metadataLength) {
-            invalidReasons.push('Metadata corrupted.');
-            return {
-              fileName,
-              filePath,
-              invalidReasons,
-              isTeams,
-              lastFrame,
-              players,
-              selected: false,
-              stageId,
-              startAt: filenameToDateAndTime(fileName, stats.birthtimeMs),
-              timeout: lastFrame === gameTimerSeconds * 60 && gameEnd[1] === 1,
-            };
-          }
-
-          const concatBuffer = Buffer.from(new Uint8Array([0x7b]));
-          const metadataUbjson = Buffer.concat([concatBuffer, metadata]);
-          const obj = decode(metadataUbjson);
-          if (lastFrame === -124) {
-            ({ lastFrame } = obj.metadata);
-          }
-          if (!Number.isInteger(lastFrame)) {
-            lastFrame = -124;
-          }
-          if (lastFrame === -124) {
-            invalidReasons.push('Unknown game duration.');
-          } else if (lastFrame <= 3476 /* 3600 - 124 */) {
-            invalidReasons.push('Game duration less than 1 minute.');
-          } else if (lastFrame === 3600 && gameEnd[1] === 1) {
-            invalidReasons.push('1 minute timed game.');
-          }
-          let startAt: Date | undefined = new Date(obj.metadata.startAt);
-          if (!startAt || Number.isNaN(startAt.getTime())) {
-            startAt = filenameToDateAndTime(fileName, stats.birthtimeMs);
-          }
-          return {
-            fileName,
-            filePath,
-            invalidReasons,
-            isTeams,
-            lastFrame,
-            players,
-            selected: false,
-            stageId,
-            startAt,
-            timeout: lastFrame === gameTimerSeconds * 60 && gameEnd[1] === 1,
-          };
+          currentPostFrameUpdateOffset -= postFrameUpdateSize;
         }
+      }
 
-        // if we reach this point, the file is incomplete.
-        // try to derive startAt
-        invalidReasons.push('Incomplete file (may freeze playback).');
+      // game end
+      const gameEnd = Buffer.alloc(gameEndSize);
+      const gameEndRes = await fileHandle.read(gameEnd, 0, gameEndSize, gameEndOffset);
+      if (gameEndRes.bytesRead !== gameEndSize || gameEnd[0] !== 0x39) {
+        invalidReasons.push('Game end event not found.');
         return {
           fileName,
           filePath,
@@ -487,35 +345,168 @@ export async function getReplaysInDir(
           startAt: filenameToDateAndTime(fileName, stats.birthtimeMs),
           timeout: false,
         };
-      } catch (e: any) {
-        const invalidReason = e instanceof Error ? e.message : e;
-        return { fileName, invalidReason };
-      } finally {
-        fileHandle.close();
       }
+      if (gameEnd[1] !== 1 && gameEnd[1] !== 2 && gameEnd[1] !== 3) {
+        let winnerI = -1;
+        const realPlayers = players.filter(
+          (player) => player.playerType === 0 || player.playerType === 1,
+        );
+        if (realPlayers.length === 2) {
+          let numPlayersWithOneStock = 0;
+          let moreThanOneStockPlayerI = -1;
+          realPlayers.forEach((player) => {
+            if (player.stocksRemaining === 1) {
+              numPlayersWithOneStock += 1;
+            } else if (player.stocksRemaining > 1) {
+              moreThanOneStockPlayerI = player.port - 1;
+            }
+          });
+          if (numPlayersWithOneStock === 1 && moreThanOneStockPlayerI !== -1) {
+            winnerI = moreThanOneStockPlayerI;
+          }
+        }
+        if (winnerI !== -1) {
+          players[winnerI].isWinner = true;
+        } else {
+          invalidReasons.push('No contest.');
+        }
+      } else {
+        for (let i = 0; i < 4; i += 1) {
+          players[i].isWinner = gameEnd[i + 3] === 0;
+        }
+        unsetWinnerIfTie(players);
+      }
+
+      // metadata
+      const metadataLength = fileSize - metadataOffset;
+      if (metadataLength <= 0) {
+        invalidReasons.push('Metadata not present.');
+        return {
+          fileName,
+          filePath,
+          invalidReasons,
+          isTeams,
+          lastFrame,
+          players,
+          selected: false,
+          stageId,
+          startAt: filenameToDateAndTime(fileName, stats.birthtimeMs),
+          timeout: lastFrame === gameTimerSeconds * 60 && gameEnd[1] === 1,
+        };
+      }
+
+      const metadata = Buffer.alloc(metadataLength);
+      const metadataReadRes = await fileHandle.read(
+        metadata,
+        0,
+        metadataLength,
+        metadataOffset,
+      );
+      if (metadataReadRes.bytesRead !== metadataLength) {
+        invalidReasons.push('Metadata corrupted.');
+        return {
+          fileName,
+          filePath,
+          invalidReasons,
+          isTeams,
+          lastFrame,
+          players,
+          selected: false,
+          stageId,
+          startAt: filenameToDateAndTime(fileName, stats.birthtimeMs),
+          timeout: lastFrame === gameTimerSeconds * 60 && gameEnd[1] === 1,
+        };
+      }
+
+      const concatBuffer = Buffer.from(new Uint8Array([0x7b]));
+      const metadataUbjson = Buffer.concat([concatBuffer, metadata]);
+      const obj = decode(metadataUbjson);
+      if (lastFrame === -124) {
+        ({ lastFrame } = obj.metadata);
+      }
+      if (!Number.isInteger(lastFrame)) {
+        lastFrame = -124;
+      }
+      if (lastFrame === -124) {
+        invalidReasons.push('Unknown game duration.');
+      } else if (lastFrame <= 3476 /* 3600 - 124 */) {
+        invalidReasons.push('Game duration less than 1 minute.');
+      } else if (lastFrame === 3600 && gameEnd[1] === 1) {
+        invalidReasons.push('1 minute timed game.');
+      }
+      let startAt: Date | undefined = new Date(obj.metadata.startAt);
+      if (!startAt || Number.isNaN(startAt.getTime())) {
+        startAt = filenameToDateAndTime(fileName, stats.birthtimeMs);
+      }
+      return {
+        fileName,
+        filePath,
+        invalidReasons,
+        isTeams,
+        lastFrame,
+        players,
+        selected: false,
+        stageId,
+        startAt,
+        timeout: lastFrame === gameTimerSeconds * 60 && gameEnd[1] === 1,
+      };
+    }
+
+    // if we reach this point, the file is incomplete.
+    // try to derive startAt
+    invalidReasons.push('Incomplete file (may freeze playback).');
+    return {
+      fileName,
+      filePath,
+      invalidReasons,
+      isTeams,
+      lastFrame,
+      players,
+      selected: false,
+      stageId,
+      startAt: filenameToDateAndTime(fileName, stats.birthtimeMs),
+      timeout: false,
+    };
+  } catch (e: any) {
+    const invalidReason = e instanceof Error ? e.message : e;
+    return { fileName, invalidReason };
+  } finally {
+    fileHandle.close();
+  }
+}
+
+export async function getReplaysByPaths(
+  filePaths: string[],
+): Promise<{ replays: Replay[]; invalidReplays: InvalidReplay[] }> {
+  const objs = filePaths
+    .filter((filePath) => filePath.toLowerCase().endsWith('.slp'))
+    .map(async (filePath): Promise<Replay | InvalidReplay> =>
+      parseReplayFile(filePath),
+    );
+
+  const results = await Promise.all(objs);
+  const replays = results
+    .filter(
+      (replayOrInvalidReplay) =>
+        !(replayOrInvalidReplay as InvalidReplay).invalidReason,
+    )
+    .map((r) => r as Replay)
+    .sort((replayA, replayB) => {
+      const diff = replayA.startAt.getTime() - replayB.startAt.getTime();
+      if (diff) {
+        return diff;
+      }
+      return replayA.fileName.localeCompare(replayB.fileName);
     });
 
-  const replays = (
-    (await Promise.all(objs)).filter(
+  const invalidReplays = results
+    .filter(
       (replayOrInvalidReplay) =>
-        !(<InvalidReplay>replayOrInvalidReplay).invalidReason,
-    ) as Replay[]
-  ).sort((replayA, replayB) => {
-    const diff = replayA.startAt.getTime() - replayB.startAt.getTime();
-    if (diff) {
-      return diff;
-    }
-    return replayA.fileName.localeCompare(replayB.fileName);
-  });
+        (replayOrInvalidReplay as InvalidReplay).invalidReason,
+    )
+    .map((r) => r as InvalidReplay)
+    .sort((a, b) => a.fileName.localeCompare(b.fileName));
 
-  const invalidReplays = (
-    (await Promise.all(objs)).filter(
-      (replayOrInvalidReplay) =>
-        (<InvalidReplay>replayOrInvalidReplay).invalidReason,
-    ) as InvalidReplay[]
-  ).sort((invalidReplayA, invalidReplayB) =>
-    invalidReplayA.fileName.localeCompare(invalidReplayB.fileName),
-  );
   return { replays, invalidReplays };
 }
 
@@ -843,7 +834,7 @@ export async function writeReplays(
     const zipBuffer = await bufferConsumer(zipFile.outputStream);
     const promises = [];
     if (isRemote) {
-      promises.push(writeZip(sanitizedSubdir, zipBuffer));
+      promises.push(writeZipRemote(sanitizedSubdir, zipBuffer));
     }
     if (dir) {
       promises.push(writeFile(`${writeDir}.zip`, zipBuffer));
@@ -877,10 +868,14 @@ export async function getReportedSubdirs(copyDir: string) {
     .map((direntAndStats) => direntAndStats.dirent);
 
   const subdirs: string[] = [];
+  let yauzl: any;
   for (let i = 0; i < sortedDirents.length; i += 1) {
     const dirent = sortedDirents[i];
     const fullPath = path.join(copyDir, dirent.name);
     if (dirent.isFile()) {
+      if (!yauzl) {
+        ({ default: yauzl } = await import('yauzl-promise'));
+      }
       // eslint-disable-next-line no-await-in-loop
       const zip = await yauzl.open(fullPath);
       try {

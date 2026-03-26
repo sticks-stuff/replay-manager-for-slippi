@@ -22,6 +22,10 @@ release/app/dist
 release/build
 .erb/dll
 
+# CLI build output
+dist/cli
+dist/tsconfig.cli.tsbuildinfo
+
 .idea
 npm-debug.log.*
 *.css.d.ts

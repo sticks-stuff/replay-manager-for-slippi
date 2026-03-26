@@ -1,5 +1,3 @@
-import { Bracket as ParryggBracketPb } from '@parry-gg/client';
-
 export type Id = string | number;
 
 export type PlayerOverrides = {
@@ -417,7 +415,14 @@ export type SlpDownloadStatus =
   | { status: 'error'; failedFiles: string[] }
   | { status: 'success' };
 
-export type ParryggBracket = ParryggBracketPb.AsObject & { sets?: Sets };
+export type ParryggBracket = {
+  id: string;
+  slug: string;
+  type: number;
+  matchesList: any[];
+  seedsList: any[];
+  sets?: Sets;
+};
 
 // Offline Mode
 export enum OfflineModeSyncState {
